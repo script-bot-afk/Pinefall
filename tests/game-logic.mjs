@@ -1,1 +1,72 @@
-// Preparing the Pinefall simulation test suite.
+import fs from 'node:fs';
+import vm from 'node:vm';
+import assert from 'node:assert/strict';
+import * as Three from '../dist/vendor/three.module.js';
+
+// Test simulation and actual Three.js geometry in Node. Only rendering and DOM are
+// replaced; this does not assert that WebGL or device-specific input has been tested.
+const nodes=new Map(),storage=new Map();
+const node=id=>{if(!nodes.has(id)){const children=new Map();nodes.set(id,{style:{setProperty(){}},hidden:false,textContent:'',innerHTML:'',value:'',classList:{add(){},remove(){},toggle(){}},addEventListener(){},setAttribute(){},setPointerCapture(){},getBoundingClientRect(){return {width:110,left:0,top:0};},querySelector(s){if(!children.has(s))children.set(s,node(id+' '+s));return children.get(s);},querySelectorAll(){return [];},requestPointerLock(){return Promise.resolve();}});}return nodes.get(id);};
+class Renderer {constructor(){this.shadowMap={};}setSize(){}setPixelRatio(){}render(s,c){s.updateMatrixWorld();c.updateMatrixWorld();}}
+const context=vm.createContext({THREE:{...Three,WebGLRenderer:Renderer},console,Math,Map,Set,JSON,Array,Number,String,Error,performance,innerWidth:1280,innerHeight:800,devicePixelRatio:1,navigator:{maxTouchPoints:0},matchMedia:()=>({matches:false}),document:{getElementById:node,body:node('body'),addEventListener(){},pointerLockElement:null,exitPointerLock(){}},window:{},addEventListener(){},requestAnimationFrame(){},localStorage:{getItem:k=>storage.get(k)||null,setItem:(k,v)=>storage.set(k,v),removeItem:k=>storage.delete(k)}});
+let source=fs.readFileSync(new URL('../dist/game.js',import.meta.url),'utf8').replace(/^import.*\n/,'');
+vm.runInContext(source,context,{timeout:10000});
+let passed=0;
+function test(name,code){const result=vm.runInContext(code,context);assert.ok(result,name);passed++;console.log('PASS '+name);}
+test('procedural world and resources initialize',`trees.length===230 && pickups.length>100 && scene.children.length>200`);
+test('fresh expedition starts at healthy land position',`startGame(false); active && state.health===100 && !blocked(player.x,player.z) && structures.length===0`);
+test('movement advances and respects world bounds',`const z0=player.z;keys.add('KeyW');updatePlayer(.1);keys.clear();player.z<z0 && blocked(100,0) && blocked(35,0)`);
+test('ground physics clamps jump back to ground',`jump(); for(let i=0;i<100;i++)updatePlayer(.02);onGround && jumpOffset===0`);
+test('actual Three raycast gathers a stone',`const testRock=pickups.find(p=>p.type==='stone');player.set(testRock.mesh.position.x,0,testRock.mesh.position.z+1.8);camera.position.set(player.x,height(player.x,player.z)+1.7,player.z);camera.lookAt(testRock.mesh.position);scene.updateMatrixWorld(true);camera.updateMatrixWorld(true);scanTarget();const wasStone=target?.resource===testRock;interact();wasStone && testRock.taken && state.stone===2`);
+test('three axe strikes fell a pine and grant wood',`const testTree=trees.find(t=>t.x<0);const ti=trees.indexOf(testTree);player.set(testTree.x,0,testTree.z+2);camera.position.set(player.x,testTree.y+1.7,player.z);camera.lookAt(testTree.x,testTree.y+1.5,testTree.z);scene.updateMatrixWorld(true);camera.updateMatrixWorld(true);for(let i=0;i<3;i++){attackCooldown=0;attack();}testTree.gone && state.wood===5`);
+test('insufficient materials do not create a structure',`state.wood=0;state.stone=0;craft('fire');!state.fire && structures.length===0`);
+test('campfire craft deducts exact resources',`player.set(-8,2,19);yaw=0;state.wood=50;state.stone=40;craft('fire');state.fire && state.wood===45 && state.stone===36 && structures.length===1`);
+test('duplicate campfire does not deduct resources',`craft('fire');state.wood===45 && structures.length===1`);
+test('overlapping structure placement is rejected',`craft('shelter');!state.shelter && state.wood===45`);
+test('shelter craft succeeds on clear ground',`player.set(0,2,19);craft('shelter');state.shelter && state.wood===37 && state.stone===33`);
+test('spear craft equips and costs resources',`craft('spear');state.spear && weapon==='spear' && state.wood===34 && state.stone===31`);
+test('berry consumption restores nutrition',`state.berries=2;state.hunger=50;state.thirst=50;eat();state.berries===1 && state.hunger===68 && state.thirst===55`);
+test('drinking at the shore replenishes water',`player.set(10,2,-3);camera.position.set(10,3,-3);camera.lookAt(35,2,-3);scene.updateMatrixWorld(true);camera.updateMatrixWorld(true);scanTarget();const water=target?.type==='water';interact();water && state.thirst===100`);
+test('campfire burns down over time',`state.time=.3;const f=structures.find(s=>s.type==='fire').fire;const f0=f.fuel;updateSurvival(5);f.fuel===f0-5`);
+test('fire can be refueled with one wood',`const f1=structures.find(s=>s.type==='fire');player.set(f1.x,2,f1.z+1.5);camera.position.set(player.x,3,player.z);camera.lookAt(f1.x,3,f1.z);scene.updateMatrixWorld(true);camera.updateMatrixWorld(true);const oldFuel=f1.fire.fuel,oldWood=state.wood;interact();f1.fire.fuel===oldFuel+55 && state.wood===oldWood-1`);
+test('shelter heals a nourished player',`const sh=structures.find(s=>s.type==='shelter');player.set(sh.x,2,sh.z);state.health=70;updateSurvival(1);state.health>70`);
+test('wolves spawn at night',`state.time=.75;updateWolves(.1);wolves.every(w=>w.group.visible)`);
+test('wolves damage an exposed player',`player.set(-25,2,25);wolves[0].group.position.set(-25,height(-25,25),26);wolves[0].cooldown=0;wolves[0].flee=0;const h0=state.health;updateWolves(.1);state.health<h0`);
+test('lit campfire prevents wolf attacks',`const safe=structures.find(s=>s.type==='fire');player.set(safe.x,2,safe.z);wolves[0].group.position.set(safe.x,2,safe.z+1);wolves[0].cooldown=0;const h1=state.health;updateWolves(.1);state.health===h1`);
+test('save and resume preserve camp, items, and position',`player.set(-11,2,22);state.berries=7;const savedWood=state.wood;const savedFuel=structures[0].fire.fuel;saveGame();startGame(true);state.berries===7 && state.wood===savedWood && player.x===-11 && player.z===22 && structures.length===2 && structures[0].fire.fuel===savedFuel`);
+test('mobile control handlers are connected',`typeof $('touch-interact').onclick==='function' && typeof $('touch-attack').onpointerdown==='function' && typeof $('touch-sprint').onclick==='function'`);
+test('beacon craft completes camp',`player.set(-3,2,25);yaw=0;craft('beacon');state.beacon && structures.length===3`);
+test('day-three dawn triggers rescue and clears save',`state.day=3;state.time=.19;updateSurvival(.01);state.won && !active && !localStorage.getItem(SAVE)`);
+test('death displays restart and clears save',`startGame(false);state.health=0;updateSurvival(.01);!active && state.health===0 && !localStorage.getItem(SAVE)`);
+// Expanded systems: test transitions and interactions, not just UI labels.
+test('legacy saves migrate without losing inventory or world changes',`(()=>{const legacy={version:1,health:80,hunger:60,thirst:70,stamina:90,wood:13,stone:9,berries:4,day:2,time:.4,fire:false,shelter:false,spear:true,beacon:false,structures:[],taken:[0],chopped:[2],won:false,player:{x:-8,z:19,yaw:0,pitch:0}};localStorage.setItem(SAVE,JSON.stringify(legacy));startGame(true);return state.version===2&&state.wood===13&&state.armor.type==='none'&&state.rounds===0&&pickups[0].taken&&trees[2].gone;})()`);
+test('armor crafting deducts materials and equips protection',`startGame(false);state.cloth=20;state.scrap=100;state.wood=60;state.stone=40;state.fuel=10;craft('clothArmor');state.armor.type==='cloth'&&state.cloth===14&&state.wood===58`);
+test('padded armor absorbs damage and loses durability',`state.health=100;applyDamage(20);state.health===85&&state.armor.durability===95`);
+test('scrap plate armor protects more than padded armor',`craft('scrapArmor');state.health=100;applyDamage(20);state.armor.type==='scrap'&&state.health===91&&state.armor.durability===89`);
+test('armor repair restores durability and uses resources',`(()=>{state.armor.durability=20;const scrap=state.scrap,cloth=state.cloth;craft('repairArmor');return state.armor.durability===70&&state.scrap===scrap-3&&state.cloth===cloth-2;})()`);
+test('broken armor does not absorb damage',`state.health=100;state.armor.durability=0;applyDamage(10);state.health===90`);
+test('a gun starts empty and ammunition is crafted separately',`craft('pistol');craft('rounds');state.pistol&&weapon==='pistol'&&state.guns.pistol===0&&state.rounds===24`);
+test('timed reload transfers only magazine capacity from reserves',`resume();reloadGun();updateEquipment(2);state.guns.pistol===10&&state.rounds===14&&reloadTimer===0`);
+test('full-magazine reload cannot consume extra ammunition',`reloadGun();state.rounds===14&&reloadTimer===0`);
+test('hitscan pistol damages a wolf and consumes one round',`(()=>{resume();player.set(-8,2,19);camera.position.set(-8,height(-8,19)+1.72,19);const w=wolves[0];w.group.position.set(-8,height(-8,13),13);w.group.visible=true;w.hp=3;w.flee=0;camera.lookAt(-8,w.group.position.y+1,13);scene.updateMatrixWorld(true);attackCooldown=0;shoot();return state.guns.pistol===9&&w.hp<3&&w.flee>0;})()`);
+test('shot cooldown prevents duplicate shots in one frame',`(()=>{const ammo=state.guns.pistol;shoot();return state.guns.pistol===ammo;})()`);
+test('tree trunks block gunfire',`(()=>{const t=trees.find(t=>!t.gone&&t.x<0);camera.position.set(t.x,t.y+1.1,t.z+3);camera.lookAt(t.x,t.y+1.1,t.z-3);const w=wolves[0];w.group.visible=true;w.group.position.set(t.x,t.y,t.z-3);w.hp=3;scene.updateMatrixWorld(true);attackCooldown=0;shoot();return w.hp===3;})()`);
+test('switching weapons cancels reload without consuming reserves',`state.guns.pistol=0;reloadGun();setWeapon('axe');reloadTimer===0&&state.rounds===14`);
+test('shotgun and rifle have separate capacities and ammo types',`state.scrap=100;state.wood=100;state.cloth=20;craft('shotgun');craft('shells');resume();reloadGun();updateEquipment(3);const shotLoaded=state.guns.shotgun===4&&state.shells===4;craft('rifle');resume();reloadGun();updateEquipment(3);shotLoaded&&state.guns.rifle===14&&state.rounds===0`);
+test('salvage is reachable through the actual interaction raycaster',`(()=>{resume();const cache=pickups.find(p=>p.salvage&&p.type==='scrap');player.set(cache.mesh.position.x,0,cache.mesh.position.z+2);camera.position.set(player.x,height(player.x,player.z)+1.7,player.z);camera.lookAt(cache.mesh.position.x,cache.mesh.position.y+.4,cache.mesh.position.z);scene.updateMatrixWorld(true);camera.updateMatrixWorld(true);const before=state.scrap;interact();return cache.taken&&state.scrap===before+10;})()`);
+test('salvage restocks at the beginning of a new day',`state.time=.999;updateSurvival(2);pickups.filter(p=>p.salvage).every(p=>!p.taken)`);
+test('crafting a motorbike creates a persistent fueled vehicle',`startGame(false);state.wood=100;state.scrap=100;state.cloth=50;state.fuel=10;craft('bike');state.bike&&vehicles.length===1&&vehicles[0].fuel===35`);
+test('mounting and throttle drive the bike and consume fuel',`(()=>{const v=vehicles[0];toggleVehicle(v);const z=v.group.position.z;keys.add('KeyW');for(let i=0;i<12;i++)updatePlayer(.05);keys.clear();return riding===v&&v.group.position.z<z&&v.fuel<35;})()`);
+test('braking slows a moving vehicle',`(()=>{const before=riding.speed;keys.add('Space');updatePlayer(.2);keys.clear();return riding.speed<before;})()`);
+test('refueling consumes one can and restores fuel',`(()=>{const before=state.fuel;riding.fuel=10;refuelVehicle(riding);return riding.fuel===40&&state.fuel===before-1;})()`);
+test('dismounting restores equipped tool',`toggleVehicle(riding);!riding&&hand.visible`);
+test('buggy has four wheels while bike has two',`player.set(1,2,22);yaw=0;craft('buggy');vehicles.length===2&&vehicles.find(v=>v.type==='buggy').wheels.length===4&&vehicles.find(v=>v.type==='bike').wheels.length===2`);
+test('vehicles cannot drive through water or world boundaries',`vehicleBlocked(35,0,vehicles[0])&&vehicleBlocked(72,30,vehicles[0])`);
+test('expanded equipment survives saving and reloading',`(()=>{state.pistol=true;state.guns.pistol=7;state.rounds=12;state.armor={type:'scrap',durability:37};setWeapon('pistol');const position=vehicles[0].group.position.clone();saveGame();startGame(true);return state.armor.durability===37&&state.guns.pistol===7&&state.rounds===12&&weapon==='pistol'&&vehicles.length===2&&vehicles[0].group.position.distanceTo(position)<.001;})()`);
+test('graphics settings alter render resources and camera',`preferences.resolution=.8;preferences.shadows=1024;preferences.grass=2500;preferences.viewDistance=170;preferences.fov=83;preferences.water=false;applySettings();detailGrass.count===2500&&camera.far===170&&camera.fov===83&&sun.shadow.mapSize.x===1024&&waterUniforms.motion.value===0`);
+test('peaceful mode removes wildlife and hard mode increases damage',`preferences.difficulty='peaceful';updateWolves(.1);const peaceful=wolves.every(w=>!w.group.visible);preferences.difficulty='hard';state.health=100;state.armor.durability=0;applyDamage(10);preferences.difficulty='normal';peaceful&&state.health===85`);
+test('endless mode keeps a completed expedition playable',`preferences.endless=true;state.beacon=true;state.day=3;state.time=.2;resume();updateSurvival(.01);active&&!state.won`);
+test('settings persist independently of expedition saves',`preferences.sensitivity=1.4;saveSettings();JSON.parse(localStorage.getItem(SETTINGS)).sensitivity===1.4`);
+test('custom shader directives use real newlines',`skyDome.material.fragmentShader.includes(String.fromCharCode(10)+'#include <tonemapping_fragment>')&&!skyDome.material.fragmentShader.includes(String.fromCharCode(92)+'n')&&lake.material.fragmentShader.includes(String.fromCharCode(10)+'#include <colorspace_fragment>')`);
+test('menu and gameplay frame paths execute with new effects',`resume();frame(performance.now()+16);returnToMenu();frame(performance.now()+32);mode==='menu'&&!gunHand.visible`);
+console.log(`\n${passed} simulation checks passed. WebGL and physical touch controls are not covered.`);
